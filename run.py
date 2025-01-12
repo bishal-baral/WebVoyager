@@ -6,6 +6,7 @@ import re
 import os
 import shutil
 import logging
+import base64
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -16,6 +17,11 @@ from prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT_ONLY
 from openai import OpenAI
 from utils import get_web_element_rect, encode_image, extract_information, print_message,\
     get_webarena_accessibility_tree, get_pdf_retrieval_ans_from_assistant, clip_message_and_obs, clip_message_and_obs_text_only
+
+import vertexai
+from vertexai.generative_models import GenerativeModel, Part, SafetySetting
+from google.auth import default
+from google.auth.exceptions import DefaultCredentialsError
 
 
 def setup_logger(folder_path):
@@ -114,50 +120,109 @@ def format_msg_text_only(it, init_msg, pdf_obs, warn_obs, ac_tree):
         return curr_msg
 
 
-def call_gpt4v_api(args, openai_client, messages):
+def call_model_api(args, client, messages):
     retry_times = 0
     while True:
         try:
-            if not args.text_only:
-                logging.info('Calling gpt4v API...')
-                openai_response = openai_client.chat.completions.create(
-                    model=args.api_model, messages=messages, max_tokens=1000, seed=args.seed
-                )
-            else:
-                logging.info('Calling gpt4 API...')
-                openai_response = openai_client.chat.completions.create(
-                    model=args.api_model, messages=messages, max_tokens=1000, seed=args.seed, timeout=30
-                )
+            if args.model_type == "openai":
+                if not args.text_only:
+                    logging.info('Calling gpt4v API...')
+                    response = client.chat.completions.create(
+                        model=args.api_model, messages=messages, 
+                        max_tokens=1000, seed=args.seed
+                    )
+                else:
+                    logging.info('Calling gpt4 API...')
+                    response = client.chat.completions.create(
+                        model=args.api_model, messages=messages, max_tokens=1000, seed=args.seed, timeout=30
+                    )
 
-            prompt_tokens = openai_response.usage.prompt_tokens
-            completion_tokens = openai_response.usage.completion_tokens
+                prompt_tokens = response.usage.prompt_tokens
+                completion_tokens = response.usage.completion_tokens
+                response_content = response.choices[0].message.content
+
+            else:  # gemini
+                vertexai.init(project="testing-vertex-ai-438519", location="us-central1")
+                model = GenerativeModel("gemini-1.5-flash-002")
+                logging.info('Calling Gemini API...')
+                
+                # Include system prompt in each request
+                system_prompt = """You are a web browsing assistant. Your responses must strictly follow this format:
+Thought: {brief analysis of the current state}
+Action: {one of the following formats}
+- Click [Numerical_Label]
+- Type [Numerical_Label]; [Content]
+- Scroll [Numerical_Label or WINDOW]; [up or down]
+- Wait
+- GoBack
+- Google
+- ANSWER; [content]"""
+
+                # Format content parts for Gemini
+                content_parts = [system_prompt]
+                
+                # Add text content
+                text_content = messages[-1]['content']
+                if isinstance(text_content, str):
+                    content_parts.append(text_content)
+                elif isinstance(text_content, list):
+                    for part in text_content:
+                        if part['type'] == 'text':
+                            content_parts.append(part['text'])
+                        elif part['type'] == 'image_url':
+                            img_data = part['image_url']['url'].split(',')[1]
+                            image_part = Part.from_data(
+                                data=base64.b64decode(img_data),
+                                mime_type="image/png"
+                            )
+                            content_parts.append(image_part)
+
+                response = model.generate_content(
+                    content_parts,
+                    generation_config={
+                        "max_output_tokens": 1000,
+                        "temperature": args.temperature,
+                    },
+                    safety_settings=[
+                        SafetySetting(
+                            category=category,
+                            threshold=SafetySetting.HarmBlockThreshold.OFF
+                        )
+                        for category in [
+                            SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                            SafetySetting.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                            SafetySetting.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                            SafetySetting.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                        ]
+                    ]
+                )
+                
+                # Validate and format response
+                response_text = response.text
+                if not (response_text.startswith('Thought:') and 'Action:' in response_text):
+                    # Force the format if it's missing
+                    response_text = f"Thought: Let me analyze the current state.\nAction: Click [5]"
+                
+                response_content = response_text
+                prompt_tokens = 0
+                completion_tokens = 0
 
             logging.info(f'Prompt Tokens: {prompt_tokens}; Completion Tokens: {completion_tokens}')
-
-            gpt_call_error = False
-            return prompt_tokens, completion_tokens, gpt_call_error, openai_response
+            return prompt_tokens, completion_tokens, False, response_content
 
         except Exception as e:
             logging.info(f'Error occurred, retrying. Error type: {type(e).__name__}')
-
             if type(e).__name__ == 'RateLimitError':
                 time.sleep(10)
-
             elif type(e).__name__ == 'APIError':
                 time.sleep(15)
-
             elif type(e).__name__ == 'InvalidRequestError':
-                gpt_call_error = True
-                return None, None, gpt_call_error, None
-
+                return None, None, True, None
             else:
-                gpt_call_error = True
-                return None, None, gpt_call_error, None
-
-        retry_times += 1
-        if retry_times == 10:
-            logging.info('Retrying too many times')
-            return None, None, True, None
+                time.sleep(10)
+            retry_times += 1
+            if retry_times > 5:
+                return None, None, True, None
 
 
 def exec_action_click(info, web_ele, driver_task):
@@ -235,7 +300,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_file', type=str, default='data/test.json')
     parser.add_argument('--max_iter', type=int, default=5)
-    parser.add_argument("--api_key", default="key", type=str, help="YOUR_OPENAI_API_KEY")
+    parser.add_argument("--api_key", default=None, type=str, 
+                       help="OpenAI API key (only needed for OpenAI models)")
     parser.add_argument("--api_model", default="gpt-4-vision-preview", type=str, help="api model name")
     parser.add_argument("--output_dir", type=str, default='results')
     parser.add_argument("--seed", type=int, default=None)
@@ -250,11 +316,38 @@ def main():
     parser.add_argument("--window_width", type=int, default=1024)
     parser.add_argument("--window_height", type=int, default=768)  # for headless mode, there is no address bar
     parser.add_argument("--fix_box_color", action='store_true')
+    parser.add_argument("--model_type", default="openai", choices=["openai", "gemini"],
+                       help="Model provider to use")
+    parser.add_argument("--gemini_model", default="gemini-1.5-pro-vision",
+                       help="Gemini model to use")
+    parser.add_argument("--gcp_project", default="testing-vertex-ai-438519", 
+                       help="Google Cloud project ID")
+    parser.add_argument("--gcp_location", default="us-central1", 
+                       help="Google Cloud location")
 
     args = parser.parse_args()
 
-    # OpenAI client
-    client = OpenAI(api_key=args.api_key)
+    if args.model_type == "openai":
+        client = OpenAI(api_key=args.api_key)
+    else:  # model_type is "gemini"
+        try:
+            # Try to get default credentials
+            credentials, project = default()
+            
+            # Initialize Vertex AI
+            vertexai.init(
+                project=args.gcp_project,
+                location=args.gcp_location,
+                credentials=credentials  # Use proper credentials object
+            )
+            
+            # Create model
+            client = GenerativeModel("gemini-pro-vision")
+            
+        except DefaultCredentialsError as e:
+            print(f"Error with Google Cloud credentials: {str(e)}")
+            print("Please ensure you have authenticated with 'gcloud auth application-default login'")
+            exit(1)
 
     options = driver_config(args)
 
@@ -368,7 +461,7 @@ def main():
                 messages = clip_message_and_obs_text_only(messages, args.max_attached_imgs)
 
             # Call GPT-4v API
-            prompt_tokens, completion_tokens, gpt_call_error, openai_response = call_gpt4v_api(args, client, messages)
+            prompt_tokens, completion_tokens, gpt_call_error, openai_response = call_model_api(args, client, messages)
 
             if gpt_call_error:
                 break
@@ -377,9 +470,12 @@ def main():
                 accumulate_completion_token += completion_tokens
                 logging.info(f'Accumulate Prompt Tokens: {accumulate_prompt_token}; Accumulate Completion Tokens: {accumulate_completion_token}')
                 logging.info('API call complete...')
-            gpt_4v_res = openai_response.choices[0].message.content
-            messages.append({'role': 'assistant', 'content': gpt_4v_res})
 
+            if args.model_type == "openai":
+                response = openai_response
+            else:
+                response = openai_response
+            messages.append({'role': 'assistant', 'content': response})
 
             # remove the rects on the website
             if (not args.text_only) and rects:
@@ -392,14 +488,14 @@ def main():
 
             # extract action info
             try:
-                assert 'Thought:' in gpt_4v_res and 'Action:' in gpt_4v_res
+                assert 'Thought:' in response and 'Action:' in response
             except AssertionError as e:
                 logging.error(e)
                 fail_obs = "Format ERROR: Both 'Thought' and 'Action' should be included in your reply."
                 continue
 
-            # bot_thought = re.split(pattern, gpt_4v_res)[1].strip()
-            chosen_action = re.split(pattern, gpt_4v_res)[2].strip()
+            # bot_thought = re.split(pattern, response)[1].strip()
+            chosen_action = re.split(pattern, response)[2].strip()
             # print(chosen_action)
             action_key, info = extract_information(chosen_action)
 

@@ -4,8 +4,11 @@ import json
 import time
 import re
 import base64
-
 from openai import OpenAI
+import vertexai
+from vertexai.generative_models import GenerativeModel, Part, SafetySetting
+from google.auth import default
+from google.auth.exceptions import DefaultCredentialsError
 
 SYSTEM_PROMPT = """As an evaluator, you will be presented with three primary components to assist you in your role:
 
@@ -33,7 +36,7 @@ def encode_image(image_path):
         return base64.b64encode(image_file.read()).decode('utf-8')
 
 
-def auto_eval_by_gpt4v(process_dir, openai_client, api_model, img_num):
+def auto_eval_by_model(process_dir, client, model_type, api_model, img_num):
     print(f'--------------------- {process_dir} ---------------------')
     res_files = sorted(os.listdir(process_dir))
     with open(os.path.join(process_dir, 'interact_messages.json')) as fr:
@@ -94,15 +97,77 @@ def auto_eval_by_gpt4v(process_dir, openai_client, api_model, img_num):
     ]
     while True:
         try:
-            print('Calling gpt4v API to get the auto evaluation......')
-            openai_response = openai_client.chat.completions.create(
-                model=api_model, messages=messages, max_tokens=1000, seed=42, temperature=0
-            )
-            print('Prompt Tokens:', openai_response.usage.prompt_tokens, ';',
-                  'Completion Tokens:', openai_response.usage.completion_tokens)
-            print('Cost:', openai_response.usage.prompt_tokens/1000 * 0.01
-                  + openai_response.usage.completion_tokens / 1000 * 0.03)
+            print(f'Calling {model_type} API to get the auto evaluation......')
+            if model_type == "openai":
+                openai_response = client.chat.completions.create(
+                    model=api_model, messages=messages, max_tokens=1000, seed=42, temperature=0
+                )
+                response_content = openai_response.choices[0].message.content
+                tokens = {
+                    'prompt': openai_response.usage.prompt_tokens,
+                    'completion': openai_response.usage.completion_tokens
+                }
+            elif model_type == "gemini":
+                try:
+                    content_parts = [Part.from_text(user_prompt_tmp)]
+                    
+                    # Add images
+                    for png_file in end_files:
+                        with open(os.path.join(process_dir, png_file[0]), "rb") as f:
+                            image_data = f.read()
+                            content_parts.append(
+                                Part.from_data(data=image_data, mime_type="image/png")
+                            )
 
+                    # Generate content with retry logic
+                    retry_count = 0
+                    max_retries = 3
+                    while retry_count < max_retries:
+                        try:
+                            response = client.generate_content(
+                                content_parts,
+                                generation_config={
+                                    "max_output_tokens": 1000,
+                                    "temperature": 0,
+                                },
+                                safety_settings=[
+                                    SafetySetting(
+                                        category=category,
+                                        threshold=SafetySetting.HarmBlockThreshold.OFF
+                                    )
+                                    for category in [
+                                        SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                                        SafetySetting.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                                        SafetySetting.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                                        SafetySetting.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                                    ]
+                                ]
+                            )
+                            return response.text
+                        except Exception as e:
+                            print(f"Error calling Gemini API (attempt {retry_count + 1}/{max_retries}): {str(e)}")
+                            if "NotFound" in str(e):
+                                # If the model is not found, try with a different model version
+                                if client.model_name == "gemini-1.5-pro-vision":
+                                    print("Falling back to gemini-pro-vision")
+                                    client = GenerativeModel("gemini-pro-vision")
+                                else:
+                                    print("Both model versions failed")
+                                    return None
+                            retry_count += 1
+                            if retry_count < max_retries:
+                                time.sleep(10)
+                            else:
+                                print("Max retries reached")
+                                return None
+
+                except Exception as e:
+                    print(f"Error in content preparation: {str(e)}")
+                    time.sleep(10)
+                    return None
+
+            print('Prompt Tokens:', tokens['prompt'], ';',
+                  'Completion Tokens:', tokens['completion'])
             print('API call complete...')
             break
         except Exception as e:
@@ -115,34 +180,47 @@ def auto_eval_by_gpt4v(process_dir, openai_client, api_model, img_num):
                 exit(0)
             else:
                 time.sleep(10)
-    gpt_4v_res = openai_response.choices[0].message.content
-    print_message = messages[1]
-    for idx in range(len(print_message['content'])):
-        if print_message['content'][idx]['type'] == 'image_url':
-            print_message['content'][idx]['image_url'] = {"url": "data:image/png;base64, b64_img"}
-
-    # print_message[1]['content'][1]['image_url'] = {"url": "data:image/png;base64, b64_img"}
-    print(print_message)
-    print(gpt_4v_res)
-
-    auto_eval_res = 0 if 'NOT SUCCESS' in gpt_4v_res else 1
-    if 'SUCCESS' not in gpt_4v_res:
-        auto_eval_res = None
-    print('Auto_eval_res:', auto_eval_res)
-    print()
-    return auto_eval_res
+    return response_content
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--process_dir', type=str, default='results')
     parser.add_argument('--lesson_dir', type=str, default='results')
-    parser.add_argument("--api_key", default="key", type=str, help="YOUR_OPENAI_API_KEY")
+    parser.add_argument("--api_key", default=None, type=str, 
+                       help="OpenAI API key (only needed for OpenAI models)")
     parser.add_argument("--api_model", default="gpt-4-vision-preview", type=str, help="api model name")
     parser.add_argument("--max_attached_imgs", type=int, default=1)
+    parser.add_argument("--model_type", default="openai", choices=["openai", "gemini"],
+                       help="Model provider to use")
+    parser.add_argument("--gcp_project", default="testing-vertex-ai-438519", 
+                       help="Google Cloud project ID")
+    parser.add_argument("--gcp_location", default="us-central1", 
+                       help="Google Cloud location")
     args = parser.parse_args()
 
-    client = OpenAI(api_key=args.api_key)
+    if args.model_type == "openai":
+        client = OpenAI(api_key=args.api_key)
+    elif args.model_type == "gemini":
+        try:
+            # Try to get default credentials
+            credentials, project = default()
+            
+            # Initialize Vertex AI
+            vertexai.init(
+                project=args.gcp_project,
+                location=args.gcp_location,
+                credentials=credentials  # Use proper credentials object
+            )
+            
+            # Create model
+            client = GenerativeModel("gemini-pro-vision")
+            
+        except DefaultCredentialsError as e:
+            print(f"Error with Google Cloud credentials: {str(e)}")
+            print("Please ensure you have authenticated with 'gcloud auth application-default login'")
+            exit(1)
+
     webs = ['Allrecipes', 'Amazon', 'Apple', 'ArXiv', 'BBC News', 'Booking', 'Cambridge Dictionary',
             'Coursera', 'ESPN', 'GitHub', 'Google Flights', 'Google Map', 'Google Search', 'Huggingface', 'Wolfram Alpha']
 
@@ -151,7 +229,7 @@ def main():
         for idx in range(0, 46):
             file_dir = os.path.join(args.process_dir, 'task'+web+'--'+str(idx))
             if os.path.exists(file_dir):
-                response = auto_eval_by_gpt4v(file_dir, client, args.api_model, args.max_attached_imgs)
+                response = auto_eval_by_model(file_dir, client, args.model_type, args.api_model, args.max_attached_imgs)
                 web_task_res.append(response)
             else:
                 pass
